@@ -1,0 +1,117 @@
+## ─── NimDB monorepo .gitignore ────────────────────────────────────────────
+
+## ═══ Nim (core/) ═══════════════════════════════════════════════════════
+nimcache/
+*.exe
+core/nimdb
+core/src/nimdb
+htmldocs/
+*.pdb
+*.dll
+*.so
+*.dylib
+# but keep intentional C-lib artifacts if ever committed on purpose:
+!drivers/c/lib/*.so
+!drivers/c/lib/*.dylib
+
+## ═══ NimDB runtime data (WAL, heap files, catalog) ═════════════════════
+nimdb_data/
+*.wal
+*.hdb
+catalog.json
+models/*.bin
+models/registry.json
+*.arrow
+*.arrow.py
+
+## ═══ Go (gateway/, drivers/go/, deploy/nimdbctl/) ══════════════════════
+**/bin/
+**/dist/
+nimdbctl
+gateway/gateway
+*.test
+*.out
+vendor/
+go.work.sum
+
+## ═══ Java (drivers/java/) ═══════════════════════════════════════════════
+target/
+*.class
+*.jar
+!gradle/wrapper/*.jar
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+out/
+.mvn/wrapper/maven-wrapper.jar
+
+## ═══ Python (drivers/python/, ml/recsys/) ══════════════════════════════
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.ipynb_checkpoints/
+dist/
+build/
+*.egg
+.tox/
+pip-log.txt
+
+## ═══ C / C++ (drivers/c/) ═══════════════════════════════════════════════
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+*.ilk
+*.pdb
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+
+## ═══ Frontend / console (console/) ══════════════════════════════════════
+node_modules/
+console/.svelte-kit/
+console/build/
+console/dist/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+## ═══ Docker / deploy ═════════════════════════════════════════════════════
+deploy/docker-compose/*.override.yml
+deploy/**/.env
+*.env
+!*.env.example
+
+## ═══ Editors / IDE ═══════════════════════════════════════════════════════
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+## ═══ Logs / temp ═════════════════════════════════════════════════════════
+*.log
+tmp/
+temp/
+.cache/
+
+## ═══ Secrets ══════════════════════════════════════════════════════════════
+*.pem
+*.key
+*.crt
+!deploy/**/*.example.crt
+secrets/
