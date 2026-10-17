@@ -1,29 +1,18 @@
-## server.nim — TCP server
-##
-## Simple line-protocol (like redis-inline):
-##   Client sends: SQL statement or special command, terminated by newline
-##   Server replies: result lines, terminated by ".\n" (success) or "!error\n"
-##
-## Special commands (not SQL):
-##   \mode <table> <oltp|olap|vector|hybrid>   — change table mode
-##   \vecinsert <table> <id> <f1,f2,...>        — insert vector
-##   \vecsearch <table> <f1,f2,...> k=<k>       — KNN search
-##   \materialise <featureGroup>                — run feature materialisation
-##   \stats <table> <col>                       — column statistics
-##   \info                                      — server info
-
-import std/[net, asyncnet, asyncdispatch, strutils, sequtils, tables]
+import std/[net, asyncnet, asyncdispatch, strutils, sequtils, tables, options]
 import ../storage/types
 import ../catalog/schema
+import ../catalog/catalog
 import ../sql/executor
 import ../ml/[tensor, vector_index, feature_store]
 import ../engine/modes
+
+import ../protocol/frame
+import ../protocol/types
 
 type
   ClientSession* = ref object
     conn*:     AsyncSocket
     engine*:   Engine
-    bufIn*:    string
 
   Server* = ref object
     socket*:   AsyncSocket
@@ -56,73 +45,116 @@ proc formatResultSet(rs: ResultSet): string =
   lines.add("(" & $rs.rows.len & " row" & (if rs.rows.len != 1: "s" else: "") & ")")
   lines.join("\n")
 
-proc sendOk(conn: AsyncSocket; msg: string) {.async.} =
-  await conn.send(msg & "\n.\n")
+# ─── Сетевые хелперы для протокола ────────────────────────────────────────
 
-proc sendErr(conn: AsyncSocket; msg: string) {.async.} =
-  await conn.send("ERROR: " & msg & "\n!\n")
+proc sendFrame(conn: AsyncSocket; opcode: ServerOpcode; payloadMsg: string; reqId: uint64 = 0) {.async.} =
+  let f = Frame(
+    opcode: uint8(opcode),
+    flags: 0,
+    version: 1,
+    requestId: reqId,
+    payload: cast[seq[byte]](payloadMsg)
+  )
+  await writeFrame(conn, f)
+
+proc sendOk(conn: AsyncSocket; msg: string; reqId: uint64 = 0) {.async.} =
+  await sendFrame(conn, opNotice, msg, reqId)
+
+proc sendErr(conn: AsyncSocket; msg: string; reqId: uint64 = 0) {.async.} =
+  await sendFrame(conn, opError, msg, reqId)
 
 # ─── Special command handlers ─────────────────────────────────────────────
 
 proc handleVecInsert(srv: Server; conn: AsyncSocket;
-                     args: seq[string]) {.async.} =
-  ## \vecinsert <table> <extId> <f1,f2,...,fn>
+                     args: seq[string]; reqId: uint64) {.async.} =
   if args.len < 3:
-    await conn.sendErr("Usage: \\vecinsert <table> <id> <f1,f2,...>")
+    await conn.sendErr("Usage: vecinsert <table> <id> <f1,f2,...>", reqId)
     return
   let tname = args[0]
-  let extId = try: parseInt(args[1]) except: -1
-  let fvals = args[2].split(',').mapIt(
-    try: parseFloat(it.strip()) except: 0.0)
-  let vec = vectorF32(fvals.mapIt(float32(it)))
+  
+  var extId = -1
+  try:
+    extId = parseInt(args[1])
+  except ValueError:
+    discard
+
+  # Разворачиваем mapIt с try в безопасный цикл
+  var fvals: seq[float32] = @[]
+  for s in args[2].split(','):
+    try:
+      fvals.add(parseFloat(s.strip()).float32)
+    except ValueError:
+      fvals.add(0.0'f32)
+      
+  let vec = vectorF32(fvals)
 
   let entry = srv.engine.catalog.getTable(tname)
   let tid   = entry.schema.tableId
+  
   if tid notin srv.vecIdxs:
     let cfg = srv.modeReg.getMode(tid)
+    let metricVal = case cfg.vecMetric
+      of "l2": dmL2
+      of "dot": dmDot
+      else: dmCosine
+      
     srv.vecIdxs[tid] = newHNSWIndex(
-      metric = case cfg.vecMetric
-               of "l2": dmL2; of "dot": dmDot; else: dmCosine,
-      M = cfg.hnswM, efC = cfg.hnswEfC, efS = cfg.hnswEfS)
+      metric = metricVal,
+      M = cfg.hnswM, 
+      efC = cfg.hnswEfC, 
+      efS = cfg.hnswEfS
+    )
+    
   srv.vecIdxs[tid].insert(vec, int64(extId))
-  await conn.sendOk("Inserted vector id=" & $extId & " dim=" & $vec.len)
+  await conn.sendOk("Inserted vector id=" & $extId & " dim=" & $vec.len, reqId)
 
 proc handleVecSearch(srv: Server; conn: AsyncSocket;
-                     args: seq[string]) {.async.} =
-  ## \vecsearch <table> <f1,f2,...> k=<k>
+                     args: seq[string]; reqId: uint64) {.async.} =
   if args.len < 2:
-    await conn.sendErr("Usage: \\vecsearch <table> <f1,...> k=<k>")
+    await conn.sendErr("Usage: vecsearch <table> <f1,...> k=<k>", reqId)
     return
   let tname = args[0]
   var k     = 10
   var fPart = args[1]
+  
   if args.len >= 3 and args[2].startsWith("k="):
-    k = try: parseInt(args[2][2..^1]) except: 10
-  let fvals = fPart.split(',').mapIt(
-    try: parseFloat(it.strip()) except: 0.0)
-  let query = vectorF32(fvals.mapIt(float32(it)))
+    try:
+      k = parseInt(args[2][2..^1])
+    except ValueError:
+      k = 10
+
+  # Разворачиваем mapIt с try в безопасный цикл
+  var fvals: seq[float32] = @[]
+  for s in fPart.split(','):
+    try:
+      fvals.add(parseFloat(s.strip()).float32)
+    except ValueError:
+      fvals.add(0.0'f32)
+      
+  let query = vectorF32(fvals)
 
   let entry = srv.engine.catalog.getTable(tname)
   let tid   = entry.schema.tableId
+  
   if tid notin srv.vecIdxs:
-    await conn.sendErr("No vector index for table: " & tname)
+    await conn.sendErr("No vector index for table: " & tname, reqId)
     return
+    
   let results = srv.vecIdxs[tid].knnSearch(query, k)
   var lines = "id\tdistance\n"
   for r in results:
     lines &= $r.extId & "\t" & $r.distance & "\n"
   lines &= "(" & $results.len & " neighbours)"
-  await conn.sendOk(lines)
+  await conn.sendFrame(opResultDone, lines, reqId)
 
 proc handleStats(srv: Server; conn: AsyncSocket;
-                 args: seq[string]) {.async.} =
+                 args: seq[string]; reqId: uint64) {.async.} =
   if args.len < 2:
-    await conn.sendErr("Usage: \\stats <table> <col>")
+    await conn.sendErr("Usage: stats <table> <col>", reqId)
     return
-  # Would need to scan columnar store — stub for now
-  await conn.sendOk("Column stats: (run \\materialise first to populate OLAP store)")
+  await conn.sendOk("Column stats: (run materialise first to populate OLAP store)", reqId)
 
-proc handleInfo(srv: Server; conn: AsyncSocket) {.async.} =
+proc handleInfo(srv: Server; conn: AsyncSocket; reqId: uint64) {.async.} =
   let msg = """NimDB v0.1.0
 Modes: OLTP | OLAP | VECTOR | HYBRID
 Storage: 8 KB heap pages, WAL, LRU buffer pool
@@ -130,73 +162,92 @@ Indexes: B+ Tree (OLTP), HNSW ANN (VECTOR)
 ML: Tensor storage, feature materialisation, train/test split
 Distribution: PA/EL, consistent hashing, gossip failure detection
 """
-  await conn.sendOk(msg)
+  await conn.sendOk(msg, reqId)
 
 proc handleMode(srv: Server; conn: AsyncSocket;
-                args: seq[string]) {.async.} =
+                args: seq[string]; reqId: uint64) {.async.} =
   if args.len < 2:
-    await conn.sendErr("Usage: \\mode <table> <oltp|olap|vector|hybrid>")
+    await conn.sendErr("Usage: mode <table> <oltp|olap|vector|hybrid>", reqId)
     return
   let tname = args[0]
-  let mode  = try: parseMode(args[1]) except: modeOLTP
+  
+  var mode = modeOLTP
+  try:
+    mode = parseMode(args[1])
+  except CatchableError:
+    discard
+    
   let entry = srv.engine.catalog.getTable(tname)
   var cfg   = defaultConfig(mode)
   srv.modeReg.setMode(entry.schema.tableId, cfg)
-  await conn.sendOk("Table '" & tname & "' mode → " & $mode &
-                    "\n" & modeDescription(mode))
+  await conn.sendOk("Table '" & tname & "' mode → " & $mode & "\n" & modeDescription(mode), reqId)
 
 # ─── Client handler ───────────────────────────────────────────────────────
 
 proc handleClient(srv: Server; conn: AsyncSocket) {.async.} =
-  await conn.send("NimDB 0.1.0 ready. Type SQL or \\help\n")
-  var buf = ""
+  await conn.sendFrame(opHelloAck, "NimDB 0.1.0 Binary Protocol Ready")
+  
   while true:
-    let line = try: await conn.recvLine() except: ""
-    if line.len == 0: break
-    let trimmed = line.strip()
-    if trimmed.len == 0: continue
+    # ИСПРАВЛЕНИЕ ЗДЕСЬ: Разделяем объявление переменной и блок try/except
+    var f: Frame
+    try: 
+      f = await readFrame(conn)
+    except IOError, EOFError:
+      break
+      
+    let reqId = f.requestId
+    let opOpt = toClientOpcode(f.opcode)
+    
+    if opOpt.isNone():
+      await conn.sendErr("Unknown client opcode: " & $f.opcode, reqId)
+      continue
+      
+    let op = opOpt.get()
+    let payloadStr = cast[string](f.payload).strip()
 
-    if trimmed.startsWith("\\"):
-      let parts = trimmed[1..^1].splitWhitespace()
-      if parts.len == 0: continue
-      let cmd = parts[0].toLowerAscii()
-      let args = parts[1..^1]
-      case cmd
-      of "vecinsert":   await srv.handleVecInsert(conn, args)
-      of "vecsearch":   await srv.handleVecSearch(conn, args)
-      of "stats":       await srv.handleStats(conn, args)
-      of "info":        await srv.handleInfo(conn)
-      of "mode":        await srv.handleMode(conn, args)
-      of "help":
-        await conn.sendOk(
-          "Commands:\n" &
-          "  SQL statements (SELECT/INSERT/UPDATE/DELETE/CREATE/DROP)\n" &
-          "  \\mode <table> <oltp|olap|vector|hybrid>\n" &
-          "  \\vecinsert <table> <id> <f1,f2,...>\n" &
-          "  \\vecsearch <table> <f1,...> k=<k>\n" &
-          "  \\stats <table> <col>\n" &
-          "  \\info\n" &
-          "  \\quit")
-      of "quit", "exit": break
-      else: await conn.sendErr("Unknown command: " & cmd)
-    else:
-      # SQL statement — may span multiple lines until ';'
-      buf &= trimmed & " "
-      if not trimmed.endsWith(";") and not trimmed.endsWith("\\"):
-        # Keep accumulating
-        discard
-      try:
-        let res = srv.engine.execute(buf.strip())
-        buf = ""
-        var out = ""
+    try:
+      case op
+      of opQuery, opExecute:
+        let res = srv.engine.execute(payloadStr)
+        var outMsg = ""
         if res.resultSet.rows.len > 0 or res.resultSet.cols.len > 0:
-          out = formatResultSet(res.resultSet)
+          outMsg = formatResultSet(res.resultSet)
         else:
-          out = res.message
-        await conn.sendOk(out)
-      except CatchableError as e:
-        buf = ""
-        await conn.sendErr(e.msg)
+          outMsg = res.message
+        await conn.sendFrame(opResultDone, outMsg, reqId)
+
+      of opVectorInsert:
+        let args = payloadStr.splitWhitespace()
+        await srv.handleVecInsert(conn, args, reqId)
+
+      of opVectorSearch:
+        let args = payloadStr.splitWhitespace()
+        await srv.handleVecSearch(conn, args, reqId)
+
+      of opAdmin:
+        let args = payloadStr.splitWhitespace()
+        if args.len > 0:
+          let cmd = args[0].toLowerAscii()
+          let cmdArgs = args[1..^1]
+          case cmd
+          of "stats": await srv.handleStats(conn, cmdArgs, reqId)
+          of "info":  await srv.handleInfo(conn, reqId)
+          of "mode":  await srv.handleMode(conn, cmdArgs, reqId)
+          else: await conn.sendErr("Unknown admin command: " & cmd, reqId)
+        else:
+          await conn.sendErr("Empty admin command", reqId)
+
+      of opPing:
+        await conn.sendFrame(opPong, "PONG", reqId)
+
+      of opClose:
+        break 
+
+      else:
+        await conn.sendErr("Opcode not yet implemented: " & $op, reqId)
+
+    except CatchableError as e:
+      await conn.sendErr("Server execution error: " & e.msg, reqId)
 
   conn.close()
 
@@ -205,7 +256,7 @@ proc serve*(srv: Server) {.async.} =
   srv.socket.setSockOpt(OptReuseAddr, true)
   srv.socket.bindAddr(srv.port)
   srv.socket.listen()
-  echo "NimDB listening on port ", int(srv.port)
+  echo "NimDB Binary Server listening on port ", int(srv.port)
   while true:
     let conn = await srv.socket.accept()
     asyncCheck srv.handleClient(conn)

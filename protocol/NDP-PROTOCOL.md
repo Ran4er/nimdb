@@ -22,7 +22,7 @@ TCP Stream
 Frame
  ┌────────────────────────────────────────────┐
  │ length(4) │ opcode(1) │ flags(1) │ ver(1)  │
- │ request_id(8) │  payload (length bytes)     │
+ │ request_id(8) │  payload (length bytes)    │
  └────────────────────────────────────────────┘
 ```
 
